@@ -1,0 +1,10 @@
+{
+  "name": "regulabond",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GenLayer contract primitive for exact-outcome regulatory evidence bounties",
+  "scripts": {
+    "test": "python -m pytest -q",
+    "check:syntax": "python -m compileall -q contracts tests"
+  }
+}
