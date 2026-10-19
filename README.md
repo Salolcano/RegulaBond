@@ -8,6 +8,14 @@ RegulaBond is a contract-first GenLayer primitive for funded review of regulator
 
 If source access or assessment is unreliable, the canonical result is `RETRYABLE`; the bounty remains locked and either the claimant or sponsor can retry. No credit is created for a retryable result.
 
+## Single live case per bounty
+
+A bounty accepts exactly one case, ever. `submit_claim` requires the bounty to be `ACTIVE` with no attached case, and records that case in `bounty_case`. Bounty status then mirrors the case while it is live:
+
+`ACTIVE (no case) → CASE_OPEN ⇄ RETRYABLE → SETTLED`
+
+A `RETRYABLE` result moves the bounty to `RETRYABLE` (not back to `ACTIVE`), so no other claimant can open a second case on the same locked funds. `adjudicate_case` and `retry_case` act only on the bounty's attached case and reject any state where the case and bounty statuses disagree. `get_bounty` returns the attached `case_id`.
+
 ## Important validator remediation
 
 The consensus-critical function returns exactly one of:
@@ -64,11 +72,11 @@ python -m compileall contracts tests
 python -m pytest -q
 ```
 
-These checks validate Python syntax and source-level invariants only. They do not replace Studio compilation, a real validator-consensus transaction, or a live GEN settlement test.
+`tests/fake_genlayer.py` is a minimal in-memory SDK stand-in that lets `tests/test_case_lifecycle.py` execute the contract's state machine and accounting. These checks validate Python syntax, source-level invariants, and lifecycle logic only. They do not replace Studio compilation, a real validator-consensus transaction, or a live GEN settlement test.
 
 ## Scope limits
 
-- Version 1 supports one case per bounty to keep the settlement model simple.
+- Version 1 supports exactly one case per bounty, enforced in contract state, to keep the settlement model simple.
 - This is not legal advice and does not determine whether an agency will enforce a regulation.
 - A public URL check does not by itself guarantee that validators can fetch the source. Failed or inconclusive source assessment must remain non-penalizing.
 - The claim is evaluated against the sponsor-locked official document and requirement; it does not prove real-world compliance by a company.

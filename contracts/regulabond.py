@@ -26,8 +26,14 @@ class RegulaBond(gl.Contract):
     bounty_requirement_id: TreeMap[str, str]
     bounty_requirement_text: TreeMap[str, str]
     bounty_status: TreeMap[str, str]
+    # The one and only case ever attached to a bounty ("" until a claim is
+    # accepted). Set once in submit_claim and never reassigned, so a bounty can
+    # never have more than one live or adjudicable case on its locked funds.
+    bounty_case: TreeMap[str, str]
 
-    # Case state. A bounty has one case in v1 to keep settlement unambiguous.
+    # Case state. A bounty has exactly one case in v1 to keep settlement
+    # unambiguous. Bounty status mirrors that case's status while it is live:
+    #   ACTIVE (no case) -> CASE_OPEN <-> RETRYABLE -> SETTLED
     case_bounty_id: TreeMap[str, str]
     case_claimant: TreeMap[str, str]
     case_claim_text: TreeMap[str, str]
@@ -49,6 +55,24 @@ class RegulaBond(gl.Contract):
 
     def _credit_key(self, bounty_id: str, owner: str) -> str:
         return bounty_id + ":" + owner
+
+    def _live_case_bounty(self, case_id: str, expected_status: str) -> str:
+        """Return the bounty ID for a live case, or raise.
+
+        A case is live only if it is the bounty's single attached case, its own
+        status is expected_status, the bounty status mirrors it, and funds
+        are still locked. Any divergence is rejected rather than repaired.
+        """
+        if self.case_status.get(case_id, "") != expected_status:
+            raise gl.vm.UserError("Case is not in the required state")
+        bounty_id = self.case_bounty_id.get(case_id, "")
+        if not bounty_id or self.bounty_case.get(bounty_id, "") != case_id:
+            raise gl.vm.UserError("Case is not the live case for its bounty")
+        if self.bounty_status.get(bounty_id, "") != expected_status:
+            raise gl.vm.UserError("Bounty and case status are out of sync")
+        if self.bounty_locked.get(bounty_id, u256(0)) == u256(0):
+            raise gl.vm.UserError("No locked bounty remains for this case")
+        return bounty_id
 
     def _require_official_url(self, url: str) -> None:
         # Exact HTTPS host/path prefix; claimant-provided mirrors are not accepted.
@@ -85,6 +109,7 @@ class RegulaBond(gl.Contract):
         self.bounty_requirement_id[bounty_id] = requirement_id
         self.bounty_requirement_text[bounty_id] = requirement_text
         self.bounty_status[bounty_id] = "DRAFT"
+        self.bounty_case[bounty_id] = ""
         self.bounty_received[bounty_id] = u256(0)
         self.bounty_locked[bounty_id] = u256(0)
         self.bounty_credited[bounty_id] = u256(0)
@@ -107,6 +132,10 @@ class RegulaBond(gl.Contract):
     def submit_claim(self, bounty_id: str, claim_text: str) -> str:
         if self.bounty_status.get(bounty_id, "") != "ACTIVE":
             raise gl.vm.UserError("Bounty is not active")
+        # One case per bounty, ever: a RETRYABLE or open case keeps the bounty
+        # out of ACTIVE, and this pointer blocks any second case regardless.
+        if self.bounty_case.get(bounty_id, "") != "":
+            raise gl.vm.UserError("This bounty already has a case")
         if not claim_text or len(claim_text) > 1200:
             raise gl.vm.UserError("Claim must be 1 to 1200 characters")
         claimant = self._sender()
@@ -119,6 +148,7 @@ class RegulaBond(gl.Contract):
         self.case_claim_text[case_id] = claim_text
         self.case_status[case_id] = "CASE_OPEN"
         self.case_verdict[case_id] = "UNRESOLVED"
+        self.bounty_case[bounty_id] = case_id
         self.bounty_status[bounty_id] = "CASE_OPEN"
         return case_id
 
@@ -170,10 +200,7 @@ Do not output scores, probabilities, numeric measurements, alternate categories,
         status = self.case_status.get(case_id, "")
         if status not in ("CASE_OPEN", "RETRYABLE"):
             raise gl.vm.UserError("Case is not awaiting adjudication")
-
-        bounty_id = self.case_bounty_id.get(case_id, "")
-        if not bounty_id or self.bounty_locked.get(bounty_id, u256(0)) == u256(0):
-            raise gl.vm.UserError("No locked bounty remains for this case")
+        bounty_id = self._live_case_bounty(case_id, status)
 
         source_url = self.bounty_source_url.get(bounty_id, "")
         requirement_id = self.bounty_requirement_id.get(bounty_id, "")
@@ -195,7 +222,9 @@ Do not output scores, probabilities, numeric measurements, alternate categories,
         if verdict == "RETRYABLE":
             self.case_status[case_id] = "RETRYABLE"
             self.case_verdict[case_id] = "RETRYABLE"
-            self.bounty_status[bounty_id] = "ACTIVE"
+            # Stay attached to this case. Returning to ACTIVE would let a
+            # different claimant open a second case on the same locked funds.
+            self.bounty_status[bounty_id] = "RETRYABLE"
             return "RETRYABLE"
 
         amount = self.bounty_locked[bounty_id]
@@ -218,15 +247,13 @@ Do not output scores, probabilities, numeric measurements, alternate categories,
     def retry_case(self, case_id: str) -> None:
         if self.case_status.get(case_id, "") != "RETRYABLE":
             raise gl.vm.UserError("Only retryable cases can be retried")
-        bounty_id = self.case_bounty_id.get(case_id, "")
+        bounty_id = self._live_case_bounty(case_id, "RETRYABLE")
         sender = self._sender()
         if sender not in (
             self.case_claimant.get(case_id, ""),
             self.bounty_sponsor.get(bounty_id, ""),
         ):
             raise gl.vm.UserError("Only claimant or sponsor can retry")
-        if self.bounty_locked.get(bounty_id, u256(0)) == u256(0):
-            raise gl.vm.UserError("No locked bounty remains")
         self.case_status[case_id] = "CASE_OPEN"
         self.case_verdict[case_id] = "UNRESOLVED"
         self.bounty_status[bounty_id] = "CASE_OPEN"
@@ -254,6 +281,7 @@ Do not output scores, probabilities, numeric measurements, alternate categories,
             "requirement_id": self.bounty_requirement_id.get(bounty_id, ""),
             "requirement_text": self.bounty_requirement_text.get(bounty_id, ""),
             "status": self.bounty_status.get(bounty_id, "NOT_FOUND"),
+            "case_id": self.bounty_case.get(bounty_id, ""),
             "received": str(self.bounty_received.get(bounty_id, u256(0))),
             "locked": str(self.bounty_locked.get(bounty_id, u256(0))),
             "credited": str(self.bounty_credited.get(bounty_id, u256(0))),
